@@ -4,11 +4,16 @@ import { Pads, Keyboard } from "@/features/instruments";
 import { Timeline, TrackActions } from "@/features/arrangement";
 import { RecordControls, RecordingStatus } from "@/features/recorder";
 import { MixerPanel } from "@/features/mixer";
+import { LoopPreview, ConditionEditor } from "@/features/conditions";
 export function App() {
   const s = useStudio();
   if (!s) return <div className="loading">正在打开夜航工作室…</div>;
   const v = s.view(),
     locked = v.recorder.status !== "idle";
+  const selectedTrack = v.selected;
+  const selectedNote =
+    selectedTrack?.notes.find((n) => n.id === v.arrangement.selectedNote) ??
+    null;
   return (
     <div className="studio-shell">
       <aside className="rail">
@@ -71,21 +76,46 @@ export function App() {
                 running={v.transport.running}
               />
             </div>
+            <LoopPreview
+              loopIndex={v.transport.loopIndex}
+              previewLoop={v.previewLoop}
+              onPreviewLoop={s.setPreviewLoop}
+              seed={v.arrangement.seed}
+              running={v.transport.running}
+              pendingCount={v.arrangement.pending.length}
+              onSeed={s.setSeed}
+              onReseed={s.reseed}
+              locked={locked}
+            />
             <TrackActions
               selected={v.selected}
               count={v.arrangement.tracks.length}
               locked={locked}
+              running={v.transport.running}
+              previewLoop={v.previewLoop}
               add={s.add}
               clear={s.clear}
               remove={s.remove}
+              bake={s.bake}
             />
             <Timeline
               tracks={v.arrangement.tracks}
               selected={v.arrangement.selected}
+              selectedNote={v.arrangement.selectedNote}
               position={v.transport.position}
               beats={v.transport.beats}
               draft={v.recorder.draft}
+              seed={v.arrangement.seed}
+              previewLoop={v.previewLoop}
               select={s.select}
+              selectNote={s.selectNote}
+            />
+            <ConditionEditor
+              track={selectedTrack ?? null}
+              note={selectedNote}
+              running={v.transport.running}
+              locked={locked}
+              onApply={s.applyCondition}
             />
             <div className="arrangement-footer">
               <span>
@@ -94,7 +124,7 @@ export function App() {
                   ? `已选择 ${v.selected.name}`
                   : "选择一条轨道开始演奏"}
               </span>
-              <span>4/4 拍 · 最多 8 条轨道</span>
+              <span>实心＝本圈演奏 · 虚影＝本圈静音 · 4/4 拍 · 最多 8 条轨道</span>
             </div>
           </section>
           <MixerPanel
@@ -125,6 +155,7 @@ export function App() {
                 record={() => void s.record()}
                 cancel={s.cancel}
                 setGrid={s.grid}
+                setMode={s.setRecordMode}
               />
             </div>
             <div className="instrument-label">

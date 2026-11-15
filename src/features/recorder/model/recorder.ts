@@ -1,5 +1,6 @@
 import type { Note, NoteInput, Instrument } from "@/shared/types";
 import { captureBoundary, recordedNote } from "../lib/quantize";
+export type RecordMode = "bake" | "evolve";
 export function createRecorder() {
   let status: "idle" | "waiting" | "recording" = "idle",
     trackId: string | null = null,
@@ -7,6 +8,7 @@ export function createRecorder() {
     start = 0,
     length = 16,
     grid = 0.25,
+    mode: RecordMode = "bake",
     draft: Note[] = [];
   const held = new Map<string, { note: NoteInput; beat: number }>();
   const release = (id: string, absolute: number) => {
@@ -34,17 +36,28 @@ export function createRecorder() {
         length,
         draft: structuredClone(draft),
         grid,
+        mode,
       };
     },
     grid(value: number) {
       if (status === "idle" && [0.25, 0.5, 1].includes(value)) grid = value;
     },
-    arm(id: string, kind: Instrument, absolute: number, beats: number) {
+    setMode(value: RecordMode) {
+      if (status === "idle") mode = value;
+    },
+    arm(
+      id: string,
+      kind: Instrument,
+      absolute: number,
+      beats: number,
+      recordMode: RecordMode,
+    ) {
       if (status !== "idle") return;
       trackId = id;
       instrument = kind;
       start = captureBoundary(absolute, beats);
       length = beats;
+      mode = recordMode;
       draft = [];
       held.clear();
       status = "waiting";
@@ -64,7 +77,11 @@ export function createRecorder() {
       if (status === "waiting" && absolute >= start) status = "recording";
       if (status === "recording" && absolute >= start + length) {
         for (const id of held.keys()) release(id, start + length);
-        const result = { trackId: trackId!, notes: structuredClone(draft) };
+        const result = {
+          trackId: trackId!,
+          notes: structuredClone(draft),
+          mode,
+        };
         status = "idle";
         trackId = null;
         draft = [];

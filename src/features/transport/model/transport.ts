@@ -18,6 +18,8 @@ export function createTransport() {
         running,
         absolute: abs,
         position: loopPosition(abs, beats),
+        // 圈序号从 0 开始；停止回到起点后再次播放即从第 0 圈复现
+        loopIndex: Math.floor(abs / beats),
       };
     },
     start(now: number) {

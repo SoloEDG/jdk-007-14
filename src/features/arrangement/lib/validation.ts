@@ -1,12 +1,34 @@
-import type { Session, Track, Note } from "@/shared/types";
+import type { Session, Track, Note, NoteCondition } from "@/shared/types";
+import { validateConditions } from "@/features/conditions";
 const object = (x: unknown): x is Record<string, unknown> =>
   !!x && typeof x === "object" && !Array.isArray(x);
 const finite = (x: unknown, min: number, max: number): x is number =>
   typeof x === "number" && Number.isFinite(x) && x >= min && x <= max;
+function normalizeCondition(raw: unknown): NoteCondition | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!object(raw)) throw new Error("触发条件数据无效");
+  if (
+    !finite(raw.probability, 0, 1) ||
+    !Number.isInteger(raw.every) ||
+    (raw.every as number) < 1 ||
+    (raw.every as number) > 64 ||
+    !Number.isInteger(raw.phase) ||
+    (raw.phase as number) < 0 ||
+    (raw.phase as number) >= (raw.every as number) ||
+    (raw.prerequisiteId !== null && typeof raw.prerequisiteId !== "string")
+  )
+    throw new Error("触发条件数据无效");
+  return {
+    probability: raw.probability as number,
+    every: raw.every as number,
+    phase: raw.phase as number,
+    prerequisiteId: raw.prerequisiteId as string | null,
+  };
+}
 export function validateSession(raw: unknown): Session {
   if (
     !object(raw) ||
-    raw.version !== 1 ||
+    ![1, 2].includes(raw.version as number) ||
     typeof raw.title !== "string" ||
     raw.title.length > 80 ||
     !finite(raw.bpm, 40, 220) ||
@@ -17,8 +39,20 @@ export function validateSession(raw: unknown): Session {
     !finite(raw.master, 0, 1)
   )
     throw new Error("存档格式或版本不受支持");
+  // v1 存档没有种子：迁移为固定种子，旧行为（每圈相同）完整保留
+  let seed = 1;
+  if (raw.version === 2) {
+    if (
+      !Number.isInteger(raw.seed) ||
+      (raw.seed as number) < 0 ||
+      (raw.seed as number) > 0xffffffff
+    )
+      throw new Error("随机种子无效");
+    seed = raw.seed as number;
+  }
   const ids = new Set<string>();
   const noteIds = new Set<string>();
+  const tracks: Track[] = [];
   for (const value of raw.tracks) {
     if (!object(value)) throw new Error("轨道损坏");
     const t = value as unknown as Track;
@@ -35,6 +69,7 @@ export function validateSession(raw: unknown): Session {
     )
       throw new Error("轨道数据无效");
     ids.add(t.id);
+    const notes: Note[] = [];
     for (const n of t.notes as Note[]) {
       if (
         !object(n) ||
@@ -52,10 +87,38 @@ export function validateSession(raw: unknown): Session {
       )
         throw new Error("音符数据无效");
       noteIds.add(n.id);
+      const condition = normalizeCondition((n as Record<string, unknown>).condition);
+      notes.push({
+        id: n.id,
+        pitch: n.pitch,
+        beat: n.beat,
+        duration: n.duration,
+        velocity: n.velocity,
+        ...(condition ? { condition } : {}),
+      });
     }
+    const track: Track = {
+      id: t.id,
+      name: t.name,
+      instrument: t.instrument,
+      color: t.color,
+      notes,
+    };
+    const conditionError = validateConditions(track);
+    if (conditionError) throw new Error(conditionError);
     const c = raw.channels[t.id];
     if (!object(c) || !finite(c.volume, 0, 1) || typeof c.muted !== "boolean")
       throw new Error("混音数据无效");
+    tracks.push(track);
   }
-  return structuredClone(raw) as unknown as Session;
+  return {
+    version: 2,
+    title: raw.title,
+    bpm: raw.bpm as number,
+    beats: raw.beats as number,
+    seed,
+    tracks,
+    channels: structuredClone(raw.channels) as Session["channels"],
+    master: raw.master as number,
+  };
 }

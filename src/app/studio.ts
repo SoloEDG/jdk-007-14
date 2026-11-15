@@ -1,12 +1,17 @@
 import { createEngine, bindPerformanceInput } from "@/features/instruments";
-import { createTransport, scheduleWindow } from "@/features/transport";
-import { createRecorder } from "@/features/recorder";
+import { createTransport, createSchedulePlanner } from "@/features/transport";
+import { createRecorder, type RecordMode } from "@/features/recorder";
 import {
   createArrangement,
   demoSession,
   saveSession,
   loadSession,
 } from "@/features/arrangement";
+import {
+  randomSeed,
+  clampSeed,
+} from "@/features/conditions";
+import type { NoteCondition } from "@/shared/types";
 import { createMixer } from "@/features/mixer";
 import type { NoteInput, Instrument, Session } from "@/shared/types";
 export function createStudio(notify: () => void) {
@@ -18,7 +23,10 @@ export function createStudio(notify: () => void) {
   const active = new Set<string>();
   let message = "欢迎来到夜航。戴上耳机，试着敲下第一拍。",
     epoch = 0,
-    disposed = false;
+    disposed = false,
+    planner = createSchedulePlanner(arrangement.getSeed()),
+    lastLoopIndex = 0,
+    previewLoop = 0;
   const now = () => engine.context?.currentTime ?? 0;
   const feedback = (text: string) => {
     message = text;
@@ -40,15 +48,25 @@ export function createStudio(notify: () => void) {
     engine.cancel();
     active.clear();
   };
+  // 种子变化（包括边界 flush 落库）后重建规划器；门控纯函数保证可复现
+  const syncPlanner = () => {
+    if (planner.seed !== arrangement.getSeed())
+      planner = createSchedulePlanner(arrangement.getSeed());
+  };
   const stop = () => {
     epoch++;
     transport.stop();
     recorder.cancel();
     cancelVoices();
+    arrangement.discardPending();
+    lastLoopIndex = 0;
+    previewLoop = 0;
+    syncPlanner();
     notify();
   };
   const pause = () => {
     epoch++;
+    // 暂停只冻结时钟：已过步骤的判定来自纯函数，继续时不会重新抽取
     transport.pause(now());
     recorder.cancel();
     cancelVoices();
@@ -67,27 +85,45 @@ export function createStudio(notify: () => void) {
     try {
       if (!(await unlock()) || token !== epoch) return;
       transport.start(now() + 0.02);
+      lastLoopIndex = transport.view(now()).loopIndex;
       tick();
       notify();
     } catch {
       feedback("声音启动失败，请再次点击播放");
     }
   };
+  const commitTake = (
+    take: { trackId: string; notes: Parameters<typeof arrangement.commit>[1]; mode: RecordMode },
+  ) =>
+    guard(() => {
+      const mode = arrangement.commitTake(take.trackId, take.notes, take.mode);
+      syncPlanner();
+      message =
+        mode === "bake"
+          ? `录制完成 · 已烘焙为 ${take.notes.length} 个确定音符（无条件）`
+          : `录制完成 · ${take.notes.length} 个新音符并入，条件继续演化`;
+    });
   const tick = () => {
     const time = now(),
       view = transport.view(time);
     const take = recorder.advance(view.absolute);
-    if (take)
-      guard(() => {
-        arrangement.commit(take.trackId, take.notes);
-        message = `录制完成 · ${take.notes.length} 个音符`;
-      });
+    if (take) commitTake(take);
+    // 跨圈边界：先把暂存修改整体落库，再排新一圈，避免声音与高亮不一致
+    if (view.running && view.loopIndex !== lastLoopIndex) {
+      if (arrangement.hasPending()) {
+        const count = arrangement.flushPending();
+        syncPlanner();
+        feedback(`已到第 ${view.loopIndex} 圈边界，${count} 项修改开始生效。`);
+      }
+      lastLoopIndex = view.loopIndex;
+      if (previewLoop < view.loopIndex) previewLoop = view.loopIndex;
+    }
     const capture = recorder.snapshot();
     const ceiling =
       capture.status === "idle" ? Infinity : capture.start + capture.length;
     const window = transport.window(time, ceiling);
     if (window)
-      scheduleWindow(
+      planner.scheduleWindow(
         arrangement.forPlayback(),
         window.from,
         window.to,
@@ -111,7 +147,7 @@ export function createStudio(notify: () => void) {
       }
       const abs = transport.view(now()).absolute;
       const take = recorder.advance(abs);
-      if (take) arrangement.commit(take.trackId, take.notes);
+      if (take) commitTake(take);
       recorder.down(id, note, abs);
       engine.play(
         {
@@ -138,6 +174,8 @@ export function createStudio(notify: () => void) {
     const valid = arrangement.restore(session);
     transport.configure(valid.bpm, valid.beats);
     mixer.restore(valid.channels, valid.master);
+    syncPlanner();
+    previewLoop = 0;
     notify();
   };
   const timer = window.setInterval(() => {
@@ -170,6 +208,7 @@ export function createStudio(notify: () => void) {
         recorder: recorder.snapshot(),
         mixer: mixer.snapshot(),
         active: new Set(active),
+        previewLoop,
         message,
       };
     },
@@ -197,6 +236,10 @@ export function createStudio(notify: () => void) {
       arrangement.select(id);
       notify();
     },
+    selectNote(id: string | null) {
+      arrangement.selectNote(id);
+      notify();
+    },
     remove() {
       guard(() => {
         const selected = arrangement.selected();
@@ -216,6 +259,56 @@ export function createStudio(notify: () => void) {
         }
       });
     },
+    setSeed(value: number) {
+      guard(() => {
+        const running = transport.view(now()).running;
+        arrangement.setSeed(clampSeed(value), running);
+        if (!running) syncPlanner();
+        feedback(
+          running
+            ? "种子已暂存，将在下一圈起点生效"
+            : "种子已更新，同一种子下各圈结果可复现",
+        );
+      });
+    },
+    reseed() {
+      this.setSeed(randomSeed());
+    },
+    setPreviewLoop(n: number) {
+      previewLoop = Math.max(0, Math.floor(n));
+      notify();
+    },
+    applyCondition(noteId: string, condition: NoteCondition | null) {
+      guard(() => {
+        const t = arrangement.selected();
+        if (!t) throw new Error("请先选择轨道");
+        const running = transport.view(now()).running;
+        arrangement.stageCondition(t.id, noteId, condition, running);
+        feedback(
+          running
+            ? "条件已暂存，下一圈起点统一生效，当前圈不变"
+            : "条件已应用；编排即时反映本圈实际演奏",
+        );
+      });
+    },
+    bake(loopIndex: number) {
+      guard(() => {
+        const t = arrangement.selected();
+        if (!t) throw new Error("请先选择轨道");
+        const running = transport.view(now()).running;
+        arrangement.stageBake(t.id, loopIndex, running);
+        if (!running) syncPlanner();
+        feedback(
+          running
+            ? `烘焙已暂存，将在圈边界把第 ${loopIndex} 圈固定为确定音符`
+            : `第 ${loopIndex} 圈已烘焙为确定音符并保存，条件已移除`,
+        );
+      });
+    },
+    setRecordMode(mode: RecordMode) {
+      recorder.setMode(mode);
+      notify();
+    },
     async record() {
       const selected = arrangement.selected();
       if (!selected) return;
@@ -224,11 +317,13 @@ export function createStudio(notify: () => void) {
         if (!(await unlock()) || token !== epoch) return;
         const state = transport.view(now());
         if (!state.running) transport.start(now() + 0.02);
+        lastLoopIndex = transport.view(now()).loopIndex;
         recorder.arm(
           selected.id,
           selected.instrument,
           transport.view(now()).absolute,
           state.beats,
+          recorder.snapshot().mode,
         );
         tick();
         notify();
@@ -269,16 +364,19 @@ export function createStudio(notify: () => void) {
         const a = arrangement.snapshot(),
           t = transport.view(now()),
           m = mixer.snapshot();
-        saveSession({
-          version: 1,
+        // 烘焙模式的轨道不含 condition；演化模式保留 condition，二者在存档中清楚区分
+        const session: Session = {
+          version: 2,
           title: a.title,
           bpm: t.bpm,
           beats: t.beats,
+          seed: a.seed,
           tracks: a.tracks,
           channels: m.channels,
           master: m.master,
-        });
-        message = "作品已保存到本机浏览器";
+        };
+        saveSession(session);
+        message = "作品已保存到本机浏览器（含种子与触发条件）";
       });
     },
     load() {
